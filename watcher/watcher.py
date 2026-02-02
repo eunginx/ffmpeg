@@ -3,7 +3,19 @@ import os
 import subprocess
 import random
 import textwrap
+import logging
 from datetime import datetime
+
+# Enable extreme verbose logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('/app/watcher_debug.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Configuration
 MEDIA_DIR = "/ffmpeg_media"
@@ -156,13 +168,22 @@ DEFAULT_OVERLAYS = [
 
 def check_real_format(remote_path):
     """Detects if a file is JPEG or PNG using magic bytes."""
+    logger.debug(f"🔍 Checking real format for: {remote_path}")
     try:
         cmd = ["docker", "exec", "ffmpeg_engine_main", "hexdump", "-n", "8", "-e", '8/1 "%02x "', remote_path]
+        logger.debug(f"🔧 Running command: {' '.join(cmd)}")
         output = subprocess.check_output(cmd, text=True).strip().lower()
-        if output.startswith("ff d8 ff"): return "jpeg"
-        if output.startswith("89 50 4e 47"): return "png"
+        logger.debug(f"📊 Hexdump output: {output}")
+        if output.startswith("ff d8 ff"): 
+            logger.debug(f"✅ Detected JPEG format for {remote_path}")
+            return "jpeg"
+        if output.startswith("89 50 4e 47"): 
+            logger.debug(f"✅ Detected PNG format for {remote_path}")
+            return "png"
+        logger.debug(f"❓ Unknown format for {remote_path}")
         return None
-    except Exception:
+    except Exception as e:
+        logger.error(f"💥 Error checking format for {remote_path}: {e}")
         return None
 
 def create_text_slide(text, font_path, output_path, font_size=100, bg_color="black", text_color="white"):
@@ -483,35 +504,73 @@ def get_remote_mtime(path):
         return 0.0
 
 def copy_local_to_docker(local_dir, docker_dir):
-    """Copy files from local directory to Docker container."""
+    """Copy files from local directory to Docker container only when needed."""
+    logger.debug(f"🔄 Starting copy check from {local_dir} to {docker_dir}")
     try:
         # Ensure local directory exists
         if not os.path.exists(local_dir):
+            logger.debug(f"❌ Local directory {local_dir} does not exist")
             return False
             
         # Get subdirectories in local path
         local_subdirs = [d for d in os.listdir(local_dir) if os.path.isdir(os.path.join(local_dir, d))]
+        logger.debug(f"📁 Found local subdirs: {local_subdirs}")
         
+        files_copied = 0
         for subdir in local_subdirs:
             local_subdir_path = os.path.join(local_dir, subdir)
             docker_subdir_path = os.path.join(docker_dir, subdir)
             
-            # Create directory in Docker container
-            subprocess.run(["docker", "exec", "ffmpeg_engine_main", "mkdir", "-p", docker_subdir_path], check=True)
-            
-            # Copy files from local to Docker
+            # Get local files with their modification times
+            local_files = {}
             for file in os.listdir(local_subdir_path):
                 local_file_path = os.path.join(local_subdir_path, file)
                 if os.path.isfile(local_file_path):
-                    # Use docker cp to copy file to container
-                    docker_dest = f"ffmpeg_engine_main:{docker_subdir_path}/{file}"
-                    subprocess.run(["docker", "cp", local_file_path, docker_dest], check=True)
+                    local_files[file] = os.path.getmtime(local_file_path)
+            
+            if not local_files:
+                logger.debug(f"📂 No files in {local_subdir_path}")
+                continue
+            
+            # Create directory in Docker container
+            subprocess.run(["docker", "exec", "ffmpeg_engine_main", "mkdir", "-p", docker_subdir_path], 
+                         check=True, capture_output=True)
+            
+            # Check which files need copying
+            for file, local_mtime in local_files.items():
+                local_file_path = os.path.join(local_subdir_path, file)
+                docker_file_path = os.path.join(docker_subdir_path, file)
+                
+                # Check if file exists in Docker and compare modification times
+                needs_copy = False
+                try:
+                    # Get Docker file modification time
+                    docker_mtime_cmd = ["docker", "exec", "ffmpeg_engine_main", "stat", "-c", "%Y", docker_file_path]
+                    docker_mtime = float(subprocess.check_output(docker_mtime_cmd, text=True).strip())
                     
-            print(f"Copied files from {local_subdir_path} to {docker_subdir_path} in container", flush=True)
+                    if local_mtime > docker_mtime:
+                        needs_copy = True
+                        logger.debug(f"🔄 File {file} needs update (local: {local_mtime}, docker: {docker_mtime})")
+                    else:
+                        logger.debug(f"✅ File {file} is up to date")
+                except subprocess.CalledProcessError:
+                    # File doesn't exist in Docker, needs copying
+                    needs_copy = True
+                    logger.debug(f"📥 File {file} doesn't exist in Docker, needs copying")
+                
+                if needs_copy:
+                    docker_dest = f"ffmpeg_engine_main:{docker_subdir_path}/{file}"
+                    subprocess.run(["docker", "cp", local_file_path, docker_dest], check=True, capture_output=True)
+                    logger.debug(f"📤 Copied {file} to Docker")
+                    files_copied += 1
+                    
+            if files_copied > 0:
+                logger.info(f"📦 Copied {files_copied} files from {local_subdir_path} to {docker_subdir_path}")
         
-        return True
+        logger.debug(f"✅ Copy check completed. {files_copied} files copied.")
+        return files_copied > 0
     except Exception as e:
-        print(f"Error copying local to Docker: {e}", flush=True)
+        logger.error(f"💥 Error copying local to Docker: {e}")
         return False
 
 def get_remote_now():
@@ -522,19 +581,25 @@ def get_remote_now():
         return time.time()
 
 def main():
+    logger.info(f"🎬 Watcher [{VERSION}] started | Polling: {MEDIA_DIR} | Local: {LOCAL_MEDIA_DIR} | Fonts: {len(FONTS)} | Colors: {len(COLOR_PAIRS)} | Phrases: {len(MARKETING_PHRASES)}")
     print(f"🎬 Watcher [{VERSION}] started | Polling: {MEDIA_DIR} | Local: {LOCAL_MEDIA_DIR} | Fonts: {len(FONTS)} | Colors: {len(COLOR_PAIRS)} | Phrases: {len(MARKETING_PHRASES)}", flush=True)
     processed_state = {}
 
     while True:
         try:
-            # Step 1: Copy files from local to Docker
-            copy_local_to_docker(LOCAL_MEDIA_DIR, MEDIA_DIR)
+            # Step 1: Copy files from local to Docker (only if needed)
+            copy_start = time.time()
+            files_updated = copy_local_to_docker(LOCAL_MEDIA_DIR, MEDIA_DIR)
+            copy_time = time.time() - copy_start
+            logger.debug(f"⏱️ Copy step took {copy_time:.2f}s")
             
             # Step 2: Scan Docker directory for processing
             subdirs = list_subdirs(MEDIA_DIR)
+            logger.debug(f"📁 Found subdirs: {subdirs}")
             print(f"📁 Checking subfolders: {subdirs}", flush=True)
             
             if not subdirs:
+                logger.debug("⏸️ No subfolders found, waiting...")
                 print("⏸️  No subfolders found, waiting...", flush=True)
                 time.sleep(POLL_INTERVAL)
                 continue
@@ -544,13 +609,16 @@ def main():
             for i, uuid in enumerate(subdirs):
                 # Show which folder we're checking and what's next
                 next_folder = subdirs[i + 1] if i + 1 < len(subdirs) else "None"
+                logger.debug(f"🔍 Checking folder: {uuid} | Next: {next_folder}")
                 print(f"🔍 Checking folder: {uuid} | Next: {next_folder}", flush=True)
                 
                 path = os.path.join(MEDIA_DIR, uuid)
                 image_files = list_image_files(path)
+                logger.debug(f"📸 Found {len(image_files)} image files in {uuid}")
                 print(f"   📸 Found {len(image_files)} image files in {uuid}", flush=True)
                 
                 if not image_files:
+                    logger.debug(f"⏭️ Skipping {uuid} - no image files")
                     print(f"   ⏭️  Skipping {uuid} - no image files", flush=True)
                     continue
                 
@@ -560,6 +628,7 @@ def main():
                     if mt > 0: mtimes.append(mt)
                 
                 if not mtimes:
+                    logger.debug(f"⏭️ Skipping {uuid} - no valid file timestamps")
                     print(f"   ⏭️  Skipping {uuid} - no valid file timestamps", flush=True)
                     continue
                     
@@ -568,21 +637,28 @@ def main():
                 # Check if already processed
                 if uuid in processed_state and max_mtime <= processed_state[uuid]:
                     time_since_change = now - max_mtime
+                    logger.debug(f"✅ {uuid} already processed (stable for {time_since_change:.1f}s)")
                     print(f"   ✅ {uuid} already processed (stable for {time_since_change:.1f}s)", flush=True)
                     continue
                 
                 time_since_change = now - max_mtime
                 if time_since_change > DEBOUNCE_TIME:
+                    logger.info(f"🚀 Processing {uuid} ({len(image_files)} files, stable for {time_since_change:.1f}s)")
                     print(f"   🚀 Processing {uuid} ({len(image_files)} files, stable for {time_since_change:.1f}s)", flush=True)
                     run_ffmpeg_robust(uuid, image_files)
                     processed_state[uuid] = max_mtime
+                    logger.info(f"✅ Completed processing {uuid}")
                     print(f"   ✅ Completed processing {uuid}", flush=True)
                 else:
+                    logger.debug(f"⏳ Waiting for {uuid} to stabilize ({time_since_change:.1f}s / {DEBOUNCE_TIME}s)")
                     print(f"   ⏳ Waiting for {uuid} to stabilize ({time_since_change:.1f}s / {DEBOUNCE_TIME}s)", flush=True)
             
+            cycle_time = time.time() - copy_start
+            logger.debug(f"⏱️ Full cycle took {cycle_time:.2f}s")
             print(f"⏱️  Cycle complete, next check in {POLL_INTERVAL}s...", flush=True)
             time.sleep(POLL_INTERVAL)
         except Exception as e:
+            logger.error(f"❌ Error in polling loop: {e}", exc_info=True)
             print(f"❌ Error in polling loop: {e}", flush=True)
             time.sleep(POLL_INTERVAL)
 
