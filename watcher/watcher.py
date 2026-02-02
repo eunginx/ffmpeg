@@ -7,11 +7,18 @@ from datetime import datetime
 
 # Configuration
 MEDIA_DIR = "/ffmpeg_media"
+LOCAL_MEDIA_DIR = "/Users/kapilh/ffmpeg/media"  # Local path to copy from
 POLL_INTERVAL = 2  # Seconds between scans
 DEBOUNCE_TIME = 5  # Wait after last change before processing
 
 # Version - update this to change output filenames
-VERSION = "v1-initial"
+VERSION = "v2-cinematic"  # Updated version name
+
+# Import cinematic utilities
+from .cinematic_utils import create_cinematic_filters, create_text_overlay, CINEMATIC_VERSION
+
+# Update version to use the one from cinematic_utils
+VERSION = CINEMATIC_VERSION
 
 # Font Registry
 FONTS = {
@@ -353,84 +360,83 @@ def run_ffmpeg_robust(uuid, image_files):
                             slice_start = random.uniform(0, max_start)
                         break
             
-            # -----------------------------
-
-            print(f"Rendering variation for {uuid} with font: {font_id}", flush=True)
-            if selected_track_path:
-                print(f"  Music: {selected_track_path} (Start: {slice_start:.2f}s, Dur: {video_duration}s)", flush=True)
-            else:
-                print(f"  Music: None (Silent fallback)", flush=True)
+            # Create cinematic filters
+            cinematic = create_cinematic_filters(
+                len(image_files),
+                duration_per_image=3.0,
+                preset="default"  # Can be "default", "dramatic", or "subtle"
+            )
             
-
-
+            # Build the FFmpeg command
+            cmd = ["docker", "exec", "ffmpeg_engine_main", "ffmpeg", "-y"]
             
-            
-            if is_slides_mode:
-                # No overlays needed, text is baked into slides
-                vf_string = "pad=ceil(iw/2)*2:ceil(ih/2)*2" 
-            else:
-                font_size = FONT_SIZES.get(font_id, 50)
-                filter_parts = [
-                    "pad=ceil(iw/2)*2:ceil(ih/2)*2" # Ensure even dims (non-negotiable)
-                ]
-                
-                for ov in overlays:
-                    # Wrap text to avoid overflow
-                    wrapped_text = textwrap.fill(ov['text'], width=20)
-                    
-                    # Escape ":" and "'" for FFmpeg drawtext
-                    safe_text = wrapped_text.replace(":", "\\:").replace("'", "'\\\\\\''")
-                    # Add fade-out in last 0.2 seconds
-                    fade_duration = 0.2
-                    alpha_expr = f"if(lt(t,{ov['end']}-{fade_duration}),1,({ov['end']}-t)/{fade_duration})"
-                    filter_parts.append(
-                        f"drawtext=fontfile='{font_path}':text='{safe_text}':enable='between(t,{ov['start']},{ov['end']})':"
-                        f"x=0.18*w+(0.64*w-text_w)/2:y=0.18*h+(0.64*h-text_h)/2:fontsize={font_size}:fontcolor=white:borderw=4:bordercolor=black:alpha='{alpha_expr}'"
-                    )
-                vf_string = ",".join(filter_parts)
-            # Use version-based filename: output_video_{font_id}_{VERSION}.mp4
-            output_filename = f"output_video_{font_id}_{VERSION}.mp4"
-            
-            # Construct FFmpeg command with correct argument order:
-            # inputs -> filters -> encoding -> output
-            
-            cmd = ["docker", "exec", "ffmpeg_engine_main", "ffmpeg"]
-            
-            # Input 1: Images
+            # Input images
             cmd.extend([
-                "-framerate", "1",
+                "-framerate", "1/3",  # 3 seconds per image
                 "-i", f"{current_proc_dir}/%04d.jpg"
             ])
             
-            # Input 2: Audio (if selected)
+            # Input audio (if any)
             if selected_track_path:
                 cmd.extend([
                     "-ss", str(slice_start),
-                    "-t", str(video_duration),
+                    "-t", str(len(image_files) * 3),  # 3 seconds per image
                     "-i", selected_track_path
                 ])
             
-            # Output Options
+            # Video filters
+            vf_parts = cinematic["video_filters"]
+            
+            # Add text overlays
+            for ov in overlays:
+                text_filter = create_text_overlay(
+                    text=ov['text'],
+                    start_time=ov['start'],
+                    end_time=ov['end'],
+                    font_path=font_path
+                )
+                vf_parts.append(text_filter)
+            
+            # Join all video filters
+            cmd.extend(["-vf", ",".join(vf_parts)])
+            
+            # Video codec settings
             cmd.extend([
-                "-vf", vf_string,
                 "-c:v", "libx264",
-                "-pix_fmt", "yuv420p"
+                "-preset", "medium",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-r", "30"  # Ensure 30fps output
             ])
             
+            # Audio settings (if audio exists)
             if selected_track_path:
                 cmd.extend([
                     "-c:a", "aac",
                     "-b:a", "192k",
-                    "-af", "volume=0.9",
+                    "-af", ",".join(cinematic["audio_filters"]),
                     "-shortest"
                 ])
             
-            cmd.extend([
-                "-y",
-                f"{uuid}/{output_filename}"
-            ])
-            subprocess.run(cmd, check=True, capture_output=True)
-            print(f"Successfully generated {output_filename} for {uuid}", flush=True)
+            # Output file with version in the name
+            output_filename = f"output_video_{font_id}_{VERSION}.mp4"
+            cmd.append(f"{uuid}/{output_filename}")
+            
+            # Run the command
+            try:
+                print(f"Running FFmpeg command: {' '.join(cmd)}", flush=True)
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                print(f"FFmpeg output: {result.stdout}", flush=True)
+                if result.stderr:
+                    print(f"FFmpeg warnings: {result.stderr}", flush=True)
+                print(f"Successfully generated {output_filename} for {uuid}", flush=True)
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"FFmpeg error: {e.stderr}", flush=True)
+                return False
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}", flush=True)
+                return False
 
         except subprocess.CalledProcessError as e:
             # Log font-specific failure but continue with remaining fonts
@@ -476,6 +482,38 @@ def get_remote_mtime(path):
     except Exception:
         return 0.0
 
+def copy_local_to_docker(local_dir, docker_dir):
+    """Copy files from local directory to Docker container."""
+    try:
+        # Ensure local directory exists
+        if not os.path.exists(local_dir):
+            return False
+            
+        # Get subdirectories in local path
+        local_subdirs = [d for d in os.listdir(local_dir) if os.path.isdir(os.path.join(local_dir, d))]
+        
+        for subdir in local_subdirs:
+            local_subdir_path = os.path.join(local_dir, subdir)
+            docker_subdir_path = os.path.join(docker_dir, subdir)
+            
+            # Create directory in Docker container
+            subprocess.run(["docker", "exec", "ffmpeg_engine_main", "mkdir", "-p", docker_subdir_path], check=True)
+            
+            # Copy files from local to Docker
+            for file in os.listdir(local_subdir_path):
+                local_file_path = os.path.join(local_subdir_path, file)
+                if os.path.isfile(local_file_path):
+                    # Use docker cp to copy file to container
+                    docker_dest = f"ffmpeg_engine_main:{docker_subdir_path}/{file}"
+                    subprocess.run(["docker", "cp", local_file_path, docker_dest], check=True)
+                    
+            print(f"Copied files from {local_subdir_path} to {docker_subdir_path} in container", flush=True)
+        
+        return True
+    except Exception as e:
+        print(f"Error copying local to Docker: {e}", flush=True)
+        return False
+
 def get_remote_now():
     try:
         output = subprocess.check_output(["docker", "exec", "ffmpeg_engine_main", "date", "+%s"], text=True).strip()
@@ -484,22 +522,36 @@ def get_remote_now():
         return time.time()
 
 def main():
-    print(f"🎬 Watcher [{VERSION}] started | Polling: {MEDIA_DIR} | Fonts: {len(FONTS)} | Colors: {len(COLOR_PAIRS)} | Phrases: {len(MARKETING_PHRASES)}", flush=True)
+    print(f"🎬 Watcher [{VERSION}] started | Polling: {MEDIA_DIR} | Local: {LOCAL_MEDIA_DIR} | Fonts: {len(FONTS)} | Colors: {len(COLOR_PAIRS)} | Phrases: {len(MARKETING_PHRASES)}", flush=True)
     processed_state = {}
 
     while True:
         try:
+            # Step 1: Copy files from local to Docker
+            copy_local_to_docker(LOCAL_MEDIA_DIR, MEDIA_DIR)
+            
+            # Step 2: Scan Docker directory for processing
             subdirs = list_subdirs(MEDIA_DIR)
-            print(f"DEBUG: Found subdirs: {subdirs}", flush=True)
+            print(f"📁 Checking subfolders: {subdirs}", flush=True)
+            
+            if not subdirs:
+                print("⏸️  No subfolders found, waiting...", flush=True)
+                time.sleep(POLL_INTERVAL)
+                continue
+                
             now = get_remote_now()
             
-            for uuid in subdirs:
-                print(f"DEBUG: Checking uuid: {uuid}", flush=True)
+            for i, uuid in enumerate(subdirs):
+                # Show which folder we're checking and what's next
+                next_folder = subdirs[i + 1] if i + 1 < len(subdirs) else "None"
+                print(f"🔍 Checking folder: {uuid} | Next: {next_folder}", flush=True)
+                
                 path = os.path.join(MEDIA_DIR, uuid)
                 image_files = list_image_files(path)
-                print(f"DEBUG: Found {len(image_files)} image files in {uuid}", flush=True)
+                print(f"   📸 Found {len(image_files)} image files in {uuid}", flush=True)
                 
                 if not image_files:
+                    print(f"   ⏭️  Skipping {uuid} - no image files", flush=True)
                     continue
                 
                 mtimes = []
@@ -508,23 +560,30 @@ def main():
                     if mt > 0: mtimes.append(mt)
                 
                 if not mtimes:
+                    print(f"   ⏭️  Skipping {uuid} - no valid file timestamps", flush=True)
                     continue
                     
                 max_mtime = max(mtimes)
                 
-                if uuid not in processed_state or max_mtime > processed_state[uuid]:
+                # Check if already processed
+                if uuid in processed_state and max_mtime <= processed_state[uuid]:
                     time_since_change = now - max_mtime
-                    if time_since_change > DEBOUNCE_TIME:
-                        print(f"Detected stable content in {uuid} ({len(image_files)} files, stable for {time_since_change:.1f}s). Processing...", flush=True)
-                        run_ffmpeg_robust(uuid, image_files)
-                        processed_state[uuid] = max_mtime
-                    else:
-                        # Only log once per change window to avoid noise
-                        pass
+                    print(f"   ✅ {uuid} already processed (stable for {time_since_change:.1f}s)", flush=True)
+                    continue
+                
+                time_since_change = now - max_mtime
+                if time_since_change > DEBOUNCE_TIME:
+                    print(f"   🚀 Processing {uuid} ({len(image_files)} files, stable for {time_since_change:.1f}s)", flush=True)
+                    run_ffmpeg_robust(uuid, image_files)
+                    processed_state[uuid] = max_mtime
+                    print(f"   ✅ Completed processing {uuid}", flush=True)
+                else:
+                    print(f"   ⏳ Waiting for {uuid} to stabilize ({time_since_change:.1f}s / {DEBOUNCE_TIME}s)", flush=True)
             
+            print(f"⏱️  Cycle complete, next check in {POLL_INTERVAL}s...", flush=True)
             time.sleep(POLL_INTERVAL)
         except Exception as e:
-            print(f"DEBUG: Error in polling loop: {e}", flush=True)
+            print(f"❌ Error in polling loop: {e}", flush=True)
             time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
