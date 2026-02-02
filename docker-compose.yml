@@ -1,5 +1,7 @@
+version: '3.8'
+
 services:
-  # The Heavy Lifter
+  # The Heavy Lifter - FFmpeg Engine
   ffmpeg_engine_main:
     image: jrottenberg/ffmpeg:8-alpine
     container_name: ffmpeg_engine_main
@@ -8,14 +10,22 @@ services:
       - /Users/kapilh/ffmpeg/music:/music
     working_dir: /ffmpeg_media
     entrypoint: ["tail", "-f", "/dev/null"] # Keeps it alive
+    restart: unless-stopped
 
-  # The Brain (The Watcher)
+  # The Brain - The Watcher with Cinematic Effects
   file_watcher_main:
     image: ffmpeg-file_watcher:latest
     container_name: file_watcher_main
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /Users/kapilh/ffmpeg/media:/ffmpeg_media
-      - /Users/kapilh/ffmpeg/watcher/watcher.py:/app/watcher.py:ro
+      - /Users/kapilh/ffmpeg/music:/music
+      - /Users/kapilh/ffmpeg/watcher:/app
+    working_dir: /app
+    command: ["python", "watcher.py"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CINEMATIC_VERSION=v2-cinematic
     depends_on:
       - ffmpeg_engine_main
+    restart: unless-stopped

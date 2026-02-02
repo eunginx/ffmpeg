@@ -7,12 +7,13 @@ import logging
 from datetime import datetime
 
 # Enable extreme verbose logging
+log_file_path = '/app/watcher_debug.log' if os.path.exists('/app') else 'watcher_debug.log'
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('/app/watcher_debug.log')
+        logging.FileHandler(log_file_path)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -24,13 +25,13 @@ POLL_INTERVAL = 2  # Seconds between scans
 DEBOUNCE_TIME = 5  # Wait after last change before processing
 
 # Version - update this to change output filenames
-VERSION = "v2-cinematic"  # Updated version name
+VERSION = "v1-test-initial"  # Test version 1
 
 # Import cinematic utilities
-from .cinematic_utils import create_cinematic_filters, create_text_overlay, CINEMATIC_VERSION
+# from .cinematic_utils import create_cinematic_filters, create_text_overlay, CINEMATIC_VERSION
 
 # Update version to use the one from cinematic_utils
-VERSION = CINEMATIC_VERSION
+# VERSION = CINEMATIC_VERSION
 
 # Font Registry
 FONTS = {
@@ -381,83 +382,79 @@ def run_ffmpeg_robust(uuid, image_files):
                             slice_start = random.uniform(0, max_start)
                         break
             
-            # Create cinematic filters
-            cinematic = create_cinematic_filters(
-                len(image_files),
-                duration_per_image=3.0,
-                preset="default"  # Can be "default", "dramatic", or "subtle"
-            )
+            print(f"Rendering variation for {uuid} with font: {font_id}", flush=True)
+            if selected_track_path:
+                print(f"  Music: {selected_track_path} (Start: {slice_start:.2f}s, Dur: {video_duration}s)", flush=True)
+            else:
+                print(f"  Music: None (Silent fallback)", flush=True)
             
-            # Build the FFmpeg command
-            cmd = ["docker", "exec", "ffmpeg_engine_main", "ffmpeg", "-y"]
+            if is_slides_mode:
+                # No overlays needed, text is baked into slides
+                vf_string = "pad=ceil(iw/2)*2:ceil(ih/2)*2" 
+            else:
+                font_size = FONT_SIZES.get(font_id, 50)
+                filter_parts = [
+                    "pad=ceil(iw/2)*2:ceil(ih/2)*2" # Ensure even dims (non-negotiable)
+                ]
+                
+                for ov in overlays:
+                    # Wrap text to avoid overflow
+                    wrapped_text = textwrap.fill(ov['text'], width=20)
+                    
+                    # Escape ":" and "'" for FFmpeg drawtext
+                    safe_text = wrapped_text.replace(":", "\\:").replace("'", "'\\\\\\''")
+                    # Add fade-out in last 0.2 seconds
+                    fade_duration = 0.2
+                    alpha_expr = f"if(lt(t,{ov['end']}-{fade_duration}),1,({ov['end']}-t)/{fade_duration})"
+                    filter_parts.append(
+                        f"drawtext=fontfile='{font_path}':text='{safe_text}':enable='between(t,{ov['start']},{ov['end']})':"
+                        f"x=0.18*w+(0.64*w-text_w)/2:y=0.18*h+(0.64*h-text_h)/2:fontsize={font_size}:fontcolor=white:borderw=4:bordercolor=black:alpha='{alpha_expr}'"
+                    )
+                vf_string = ",".join(filter_parts)
             
-            # Input images
+            # Use version-based filename: output_video_{font_id}_{VERSION}.mp4
+            output_filename = f"output_video_{font_id}_{VERSION}.mp4"
+            
+            # Construct FFmpeg command with correct argument order:
+            # inputs -> filters -> encoding -> output
+            
+            cmd = ["docker", "exec", "ffmpeg_engine_main", "ffmpeg"]
+            
+            # Input 1: Images
             cmd.extend([
-                "-framerate", "1/3",  # 3 seconds per image
+                "-framerate", "1",
                 "-i", f"{current_proc_dir}/%04d.jpg"
             ])
             
-            # Input audio (if any)
+            # Input 2: Audio (if selected)
             if selected_track_path:
                 cmd.extend([
                     "-ss", str(slice_start),
-                    "-t", str(len(image_files) * 3),  # 3 seconds per image
+                    "-t", str(video_duration),
                     "-i", selected_track_path
                 ])
             
-            # Video filters
-            vf_parts = cinematic["video_filters"]
-            
-            # Add text overlays
-            for ov in overlays:
-                text_filter = create_text_overlay(
-                    text=ov['text'],
-                    start_time=ov['start'],
-                    end_time=ov['end'],
-                    font_path=font_path
-                )
-                vf_parts.append(text_filter)
-            
-            # Join all video filters
-            cmd.extend(["-vf", ",".join(vf_parts)])
-            
-            # Video codec settings
+            # Output Options
             cmd.extend([
+                "-vf", vf_string,
                 "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-r", "30"  # Ensure 30fps output
+                "-pix_fmt", "yuv420p"
             ])
             
-            # Audio settings (if audio exists)
             if selected_track_path:
                 cmd.extend([
                     "-c:a", "aac",
                     "-b:a", "192k",
-                    "-af", ",".join(cinematic["audio_filters"]),
+                    "-af", "volume=0.9",
                     "-shortest"
                 ])
             
-            # Output file with version in the name
-            output_filename = f"output_video_{font_id}_{VERSION}.mp4"
-            cmd.append(f"{uuid}/{output_filename}")
-            
-            # Run the command
-            try:
-                print(f"Running FFmpeg command: {' '.join(cmd)}", flush=True)
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-                print(f"FFmpeg output: {result.stdout}", flush=True)
-                if result.stderr:
-                    print(f"FFmpeg warnings: {result.stderr}", flush=True)
-                print(f"Successfully generated {output_filename} for {uuid}", flush=True)
-                return True
-            except subprocess.CalledProcessError as e:
-                print(f"FFmpeg error: {e.stderr}", flush=True)
-                return False
-            except Exception as e:
-                print(f"Unexpected error: {str(e)}", flush=True)
-                return False
+            cmd.extend([
+                "-y",
+                f"{uuid}/{output_filename}"
+            ])
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"Successfully generated {output_filename} for {uuid}", flush=True)
 
         except subprocess.CalledProcessError as e:
             # Log font-specific failure but continue with remaining fonts
