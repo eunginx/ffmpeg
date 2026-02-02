@@ -5,6 +5,7 @@ services:
     container_name: ffmpeg_engine_main
     volumes:
       - /Users/kapilh/ffmpeg/media:/ffmpeg_media
+      - /Users/kapilh/ffmpeg/music:/music
     working_dir: /ffmpeg_media
     entrypoint: ["tail", "-f", "/dev/null"] # Keeps it alive
 
