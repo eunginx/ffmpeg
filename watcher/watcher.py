@@ -25,7 +25,7 @@ POLL_INTERVAL = 2  # Seconds between scans
 DEBOUNCE_TIME = 5  # Wait after last change before processing
 
 # Version - update this to change output filenames
-VERSION = "v1-test-initial"  # Test version 1
+VERSION = "v2-test-cinematic"  # Test version 2
 
 # Import cinematic utilities
 # from .cinematic_utils import create_cinematic_filters, create_text_overlay, CINEMATIC_VERSION
