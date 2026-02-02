@@ -1,0 +1,20 @@
+services:
+  # The Heavy Lifter
+  ffmpeg_engine_main:
+    image: jrottenberg/ffmpeg:8-alpine
+    container_name: ffmpeg_engine_main
+    volumes:
+      - /Users/kapilh/ffmpeg/media:/ffmpeg_media
+    working_dir: /ffmpeg_media
+    entrypoint: ["tail", "-f", "/dev/null"] # Keeps it alive
+
+  # The Brain (The Watcher)
+  file_watcher_main:
+    image: ffmpeg-file_watcher:latest
+    container_name: file_watcher_main
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /Users/kapilh/ffmpeg/media:/ffmpeg_media
+      - /Users/kapilh/ffmpeg/watcher/watcher.py:/app/watcher.py:ro
+    depends_on:
+      - ffmpeg_engine_main
